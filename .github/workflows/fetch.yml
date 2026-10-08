@@ -1,0 +1,32 @@
+name: Fetch Site
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"   # daily; remove if you only want manual runs
+
+permissions:
+  contents: write
+
+env:
+  SITE_URL: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/svg/site.svg
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download site to repo root
+        run: |
+          curl -fsSL --retry 3 "$SITE_URL" -o site.svg
+          test -s site.svg
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site.svg
+          git diff --cached --quiet || git commit -m "Update site.svg"
+          git push
