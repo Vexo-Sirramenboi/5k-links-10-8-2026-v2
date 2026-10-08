@@ -1,9 +1,8 @@
-name: Duplicate Template Deployer
+name: Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
   workflow_run:
     workflows: ["Fetch Site"]
@@ -13,188 +12,25 @@ permissions:
   contents: write
 
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-
-      - name: Generate 5,000 Nested Random Pages
+      - name: Stage site files
         run: |
-          node -e '
-          const fs = require("fs");
-
-          const template = fs.readFileSync("template.html", "utf8");
-          fs.mkdirSync("dist", { recursive: true });
-
-          const TOTAL_PAGES = 5000;
-          const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-          // Generates a single segment of random characters
-          function getRandomSegment(minLen = 4, maxLen = 10) {
-            const length = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
-            let segment = "";
-            for (let i = 0; i < length; i++) {
-              segment += chars.charAt(Math.floor(Math.random() * chars.length));
-            }
-            return segment;
-          }
-
-          // Generates a nested path like seg1/seg2 or seg1/seg2/seg3 (2 to 4 segments)
-          function getNestedPath(minSegments = 2, maxSegments = 4) {
-            const depth = Math.floor(Math.random() * (maxSegments - minSegments + 1)) + minSegments;
-            const segments = [];
-            for (let i = 0; i < depth; i++) {
-              segments.push(getRandomSegment(4, 10));
-            }
-            return segments.join("/");
-          }
-
-          // Ensure 5,000 unique paths
-          const uniquePaths = new Set();
-          while (uniquePaths.size < TOTAL_PAGES) {
-            uniquePaths.add(getNestedPath(2, 4));
-          }
-
-          let masterLinksHtml = "";
-
-          for (const nestedPath of uniquePaths) {
-            const folderPath = `dist/${nestedPath}`;
-            // recursive: true handles all nested subdirectories
-            fs.mkdirSync(folderPath, { recursive: true });
-
-            fs.writeFileSync(`${folderPath}/index.html`, template);
-
-            masterLinksHtml += `<a class="card" href="./${nestedPath}/">${nestedPath}</a>\n`;
-          }
-
-          const masterIndexHtml = `<!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Directory Index</title>
-            <style>
-              * { box-sizing: border-box; margin: 0; padding: 0; }
-              body {
-                background: #0d1117;
-                color: #c9d1d9;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                padding: 40px 20px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-              }
-              header {
-                text-align: center;
-                margin-bottom: 28px;
-                max-width: 650px;
-                width: 100%;
-              }
-              h1 {
-                font-size: 28px;
-                font-weight: 700;
-                color: #f0f6fc;
-                margin-bottom: 8px;
-              }
-              p {
-                color: #8b949e;
-                font-size: 14px;
-                margin-bottom: 20px;
-              }
-              .search-box {
-                width: 100%;
-                padding: 12px 18px;
-                border-radius: 8px;
-                border: 1px solid #30363d;
-                background: #161b22;
-                color: #f0f6fc;
-                font-size: 15px;
-                outline: none;
-                transition: border-color 0.2s ease, box-shadow 0.2s ease;
-              }
-              .search-box:focus {
-                border-color: #58a6ff;
-                box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.2);
-              }
-              .grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-                gap: 10px;
-                width: 100%;
-                max-width: 1300px;
-              }
-              .card {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                background: #161b22;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                padding: 12px;
-                color: #58a6ff;
-                text-decoration: none;
-                font-size: 12px;
-                font-family: monospace;
-                word-break: break-all;
-                text-align: center;
-                transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
-              }
-              .card:hover {
-                background: #21262d;
-                border-color: #58a6ff;
-                color: #79c0ff;
-                transform: translateY(-2px);
-              }
-              .hidden {
-                display: none !important;
-              }
-            </style>
-          </head>
-          <body>
-            <header>
-              <h1>Directory Index</h1>
-              <p>5,000 Nested Random Paths</p>
-              <input type="text" id="filter" class="search-box" placeholder="Quick find path..." autocomplete="off" />
-            </header>
-
-            <main class="grid" id="link-grid">
-              ${masterLinksHtml}
-            </main>
-
-            <script>
-              const filter = document.getElementById("filter");
-              const links = document.querySelectorAll(".card");
-
-              filter.addEventListener("input", (e) => {
-                const term = e.target.value.toLowerCase().trim();
-                links.forEach(card => {
-                  if (card.textContent.toLowerCase().includes(term)) {
-                    card.classList.remove("hidden");
-                  } else {
-                    card.classList.add("hidden");
-                  }
-                });
-              });
-            </script>
-          </body>
-          </html>`;
-
-          fs.writeFileSync("dist/index.html", masterIndexHtml);
-          '
-
-      - name: Copy mirrored site into the site root
-        run: |
-          if [ -d site ]; then
-            # keep the generated directory index as the root page; mirrored files live alongside it
-            cp -rn site/. dist/
+          if [ ! -f index.html ]; then
+            echo "::error::index.html not found. Run the 'Fetch Site' workflow first."
+            exit 1
           fi
+          mkdir dist
+          rsync -a \
+            --exclude '.git' --exclude '.github' --exclude 'scripts' \
+            --exclude 'node_modules' --exclude 'package*.json' --exclude 'dist' \
+            ./ dist/
+          touch dist/.nojekyll   # so Pages serves the _ext folder
+          find dist -type f | head -30
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
