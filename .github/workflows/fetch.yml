@@ -10,6 +10,8 @@ permissions:
 
 env:
   SITE_URL: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/svg/site.svg
+  # "/<repo-name>" for a project Pages site (user.github.io/repo/); "" for a custom domain or user/org site
+  BASE_PATH: /${{ github.event.repository.name }}
 
 jobs:
   fetch:
@@ -18,15 +20,26 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Download site to repo root
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright + Chromium
         run: |
-          curl -fsSL --retry 3 "$SITE_URL" -o site.svg
-          test -s site.svg
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: Crawl site and save all dependencies
+        run: |
+          rm -rf site
+          node scripts/mirror.js "$SITE_URL" site
+          test -f site/index.html
 
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site.svg
-          git diff --cached --quiet || git commit -m "Update site.svg"
+          git add -A site
+          git diff --cached --quiet || git commit -m "Update mirrored site"
           git push
