@@ -2,15 +2,13 @@ name: Fetch Site
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *"   # daily; remove if you only want manual runs
 
 permissions:
   contents: write
 
 env:
   SITE_URL: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/svg/site.svg
-  # "/<repo-name>" for a project Pages site (user.github.io/repo/); "" for a custom domain or user/org site
+  # "/<repo-name>" for a project Pages site (user.github.io/repo/); set to "" for a custom domain or a user.github.io repo
   BASE_PATH: /${{ github.event.repository.name }}
 
 jobs:
@@ -30,16 +28,16 @@ jobs:
           npm install --no-save playwright
           npx playwright install --with-deps chromium
 
-      - name: Crawl site and save all dependencies
+      - name: Crawl site into the repo root
         run: |
-          rm -rf site
-          node scripts/mirror.js "$SITE_URL" site
-          test -f site/index.html
+          rm -rf _ext index.html
+          node scripts/mirror.js "$SITE_URL" .
+          test -f index.html
 
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A site
+          git add -A _ext index.html
           git diff --cached --quiet || git commit -m "Update mirrored site"
           git push
