@@ -1,36 +1,239 @@
-name: Deploy
+name: Mirror + 5,000 Pages Deployer
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Fetch Site"]
-    types: [completed]
+  schedule:
+    - cron: "0 6 * * *"   # re-crawl daily; delete these two lines for manual/push only
 
 permissions:
   contents: write
 
+env:
+  SITE_URL: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/svg/site.svg
+  TOTAL_PAGES: 5000
+  # "/<repo-name>" for a project Pages site (user.github.io/repo/); set to "" for a custom domain or user.github.io repo
+  BASE_PATH: /${{ github.event.repository.name }}
+
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Stage site files
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright + Chromium
         run: |
-          if [ ! -f index.html ]; then
-            echo "::error::index.html not found. Run the 'Fetch Site' workflow first."
-            exit 1
-          fi
-          mkdir dist
-          rsync -a \
-            --exclude '.git' --exclude '.github' --exclude 'scripts' \
-            --exclude 'node_modules' --exclude 'package*.json' --exclude 'dist' \
-            ./ dist/
-          touch dist/.nojekyll   # so Pages serves the _ext folder
-          find dist -type f | head -30
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: Write build scripts
+        run: |
+          mkdir -p .build
+          cat > .build/mirror.js <<'MIRROR_EOF'
+          // Usage: node scripts/mirror.js <start-url> [outDir]
+          // Loads the URL in headless Chromium, saves every resource it requests
+          // (scripts, CSS, fonts, images, XHR/fetch...) under <outDir>/_ext/<host>/<path>,
+          // rewrites absolute URLs inside text files to the local copies, and writes
+          // <outDir>/index.html pointing at the saved start document.
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+
+          const START = process.argv[2];
+          const OUT = process.argv[3] || 'site';
+          const BASE = (process.env.BASE_PATH || '').replace(/\/$/, ''); // e.g. "/my-repo" for project Pages, "" for custom domain/user site
+          const SETTLE_MS = Number(process.env.SETTLE_MS || 8000);
+
+          if (!START) { console.error('usage: node scripts/mirror.js <url> [outDir]'); process.exit(1); }
+
+          const EXT = {
+            'text/html': '.html', 'text/css': '.css', 'application/javascript': '.js', 'text/javascript': '.js',
+            'application/x-javascript': '.js', 'application/json': '.json', 'image/svg+xml': '.svg',
+            'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
+            'image/x-icon': '.ico', 'image/vnd.microsoft.icon': '.ico', 'font/woff2': '.woff2',
+            'font/woff': '.woff', 'font/ttf': '.ttf', 'application/wasm': '.wasm', 'audio/mpeg': '.mp3',
+            'video/mp4': '.mp4', 'application/font-woff2': '.woff2', 'application/font-woff': '.woff',
+          };
+          const TEXT = /^(text\/|application\/(javascript|x-javascript|json)|image\/svg)/;
+
+          function localPathFor(url, contentType) {
+            const u = new URL(url);
+            let p = decodeURIComponent(u.pathname);
+            if (p.endsWith('/')) p += 'index';
+            const ct = (contentType || '').split(';')[0].trim().toLowerCase();
+            let ext = path.extname(p);
+            if (!ext && EXT[ct]) { p += EXT[ct]; ext = EXT[ct]; }
+            if (u.search) {
+              const h = crypto.createHash('md5').update(u.search).digest('hex').slice(0, 8);
+              p = p.slice(0, p.length - ext.length) + '.' + h + ext;
+            }
+            p = p.replace(/[:*?"<>|\\]/g, '_');
+            return `_ext/${u.host.replace(":", "_")}${p}`;
+          }
+
+          (async () => {
+            const browser = await chromium.launch({
+              executablePath: process.env.CHROMIUM_PATH || undefined,
+              args: ['--no-sandbox'],
+            });
+            const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+            const page = await ctx.newPage();
+
+            const saved = new Map(); // url -> { rel, type, body }
+            const pending = [];
+            page.on('response', (res) => {
+              pending.push((async () => {
+                try {
+                  const url = res.url();
+                  if (!/^https?:/.test(url) || res.request().method() !== 'GET') return;
+                  if (res.status() < 200 || res.status() >= 300 || saved.has(url)) return;
+                  const type = res.headers()['content-type'] || '';
+                  const body = await res.body();
+                  saved.set(url, { rel: localPathFor(url, type), type, body });
+                } catch { /* redirects / aborted requests have no body */ }
+              })());
+            });
+
+            await page.goto(START, { waitUntil: 'networkidle', timeout: 60000 }).catch((e) => console.warn('goto:', e.message));
+            // nudge lazy loaders
+            await page.evaluate(async () => {
+              for (let y = 0; y < document.body?.scrollHeight; y += 600) { window.scrollTo(0, y); await new Promise(r => setTimeout(r, 100)); }
+              window.scrollTo(0, 0);
+            }).catch(() => {});
+            await page.waitForTimeout(SETTLE_MS);
+            await Promise.all(pending);
+            await browser.close();
+
+            if (!saved.has(START)) {
+              // start URL may have redirected; take the first saved document as entry
+              console.warn('Start URL response not captured directly.');
+            }
+
+            // build rewrite table (longest URLs first); handle https://, http:// and protocol-relative forms
+            const entries = [...saved.entries()].sort((a, b) => b[0].length - a[0].length);
+            const rewrite = (text) => {
+              for (const [url, { rel }] of entries) {
+                const local = `${BASE}/${rel}`;
+                text = text.split(url).join(local);
+                text = text.split(url.replace(/^https?:/, '')).join(local);
+              }
+              return text;
+            };
+
+            for (const [url, { rel, type, body }] of saved) {
+              const dest = path.join(OUT, rel);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              const isText = TEXT.test(type.split(';')[0].trim().toLowerCase()) || /\.(svg|css|js|html|json)$/.test(rel);
+              fs.writeFileSync(dest, isText ? rewrite(body.toString('utf8')) : body);
+            }
+
+            const entry = saved.get(START);
+            const entryRel = entry ? entry.rel : [...saved.values()][0]?.rel;
+            if (!entryRel) { console.error('Nothing was captured.'); process.exit(1); }
+            fs.mkdirSync(OUT, { recursive: true });
+            fs.writeFileSync(path.join(OUT, 'index.html'),
+              `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Redirecting…</title>` +
+              `<meta http-equiv="refresh" content="0; url=./${entryRel}"></head>` +
+              `<body><a href="./${entryRel}">Continue</a></body></html>`);
+
+            console.log(`Saved ${saved.size} files to ${OUT}/ (entry: ${entryRel})`);
+            for (const { rel } of saved.values()) console.log('  ' + rel);
+          })();
+          MIRROR_EOF
+          cat > .build/generate-pages.js <<'GENERATE_EOF'
+          // Usage: node scripts/generate-pages.js <distDir>
+          // Creates TOTAL unique random nested paths inside <distDir>. Each path gets an index.html
+          // that shows the mirrored site full-screen (iframe), so the URL stays on the random path
+          // and the mirrored files (in _ext/) are shared instead of copied 5,000 times.
+          // Also writes <distDir>/links/index.html (searchable list) and <distDir>/links.txt.
+          const fs = require('fs');
+          const path = require('path');
+
+          const DIST = process.argv[2] || 'dist';
+          const TOTAL = Number(process.env.TOTAL_PAGES || 5000);
+          const BASE = (process.env.BASE_PATH || '').replace(/\/$/, '');
+
+          // find the mirrored entry document from the redirect index.html written by mirror.js
+          const rootIndex = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
+          const m = rootIndex.match(/url=\.\/([^"]+)"/);
+          if (!m) { console.error('Could not find mirrored entry in index.html (run Fetch Site first).'); process.exit(1); }
+          const ENTRY = `${BASE}/${m[1]}`;
+
+          const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+          const seg = (min = 4, max = 10) => {
+            const n = Math.floor(Math.random() * (max - min + 1)) + min;
+            let s = '';
+            for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
+            return s;
+          };
+          const nested = () => Array.from({ length: 2 + Math.floor(Math.random() * 3) }, () => seg()).join('/');
+
+          const paths = new Set();
+          while (paths.size < TOTAL) {
+            const p = nested();
+            // avoid colliding with reserved top-level names or being a prefix of another path
+            if (['_ext', 'links'].includes(p.split('/')[0])) continue;
+            paths.add(p);
+          }
+
+          const page = `<!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Loading</title>
+          <style>html,body{margin:0;height:100%;background:#000}iframe{border:0;width:100%;height:100%;display:block}</style>
+          </head><body><iframe src="${ENTRY}" allow="fullscreen; autoplay; clipboard-write" allowfullscreen></iframe></body></html>
+          `;
+
+          for (const p of paths) {
+            const dir = path.join(DIST, p);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, 'index.html'), page);
+          }
+
+          const list = [...paths];
+          fs.writeFileSync(path.join(DIST, 'links.txt'), list.map(p => `${BASE}/${p}/`).join('\n') + '\n');
+          fs.mkdirSync(path.join(DIST, 'links'), { recursive: true });
+          fs.writeFileSync(path.join(DIST, 'links', 'index.html'), `<!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Links</title>
+          <style>
+          *{box-sizing:border-box}body{margin:0;padding:32px 16px;background:#0d1117;color:#c9d1d9;font-family:system-ui,sans-serif}
+          h1{text-align:center;color:#f0f6fc;margin:0 0 6px}p{text-align:center;color:#8b949e;margin:0 0 18px}
+          input{display:block;margin:0 auto 20px;width:100%;max-width:640px;padding:12px 16px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#f0f6fc;font-size:15px}
+          .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px;max-width:1300px;margin:0 auto}
+          a{display:block;padding:10px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#58a6ff;font:12px monospace;text-align:center;text-decoration:none;word-break:break-all}
+          a:hover{background:#21262d}.hidden{display:none}
+          </style></head><body>
+          <h1>Links</h1><p>${TOTAL.toLocaleString()} paths</p>
+          <input id="f" placeholder="Filter…" autocomplete="off">
+          <main class="grid" id="g">${list.map(p => `<a href="${BASE}/${p}/">${p}</a>`).join('')}</main>
+          <script>
+          const cards=[...document.querySelectorAll('#g a')];
+          document.getElementById('f').addEventListener('input',e=>{const t=e.target.value.toLowerCase().trim();cards.forEach(c=>c.classList.toggle('hidden',!c.textContent.includes(t)))});
+          </script></body></html>`);
+
+          console.log(`Generated ${paths.size} pages -> ${DIST} (entry ${ENTRY})`);
+          GENERATE_EOF
+
+      - name: Crawl site and save all dependencies
+        run: |
+          mkdir -p dist
+          node .build/mirror.js "$SITE_URL" dist
+          touch dist/.nojekyll
+          test -f dist/index.html
+
+      - name: Generate 5,000 random nested pages
+        run: node .build/generate-pages.js dist
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
