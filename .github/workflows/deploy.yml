@@ -189,9 +189,12 @@ jobs:
           fs.writeFileSync("dist/index.html", masterIndexHtml);
           '
 
-      - name: Copy fetched site into the site root
+      - name: Copy mirrored site into the site root
         run: |
-          if [ -f site.svg ]; then cp site.svg dist/site.svg; fi
+          if [ -d site ]; then
+            # keep the generated directory index as the root page; mirrored files live alongside it
+            cp -rn site/. dist/
+          fi
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
