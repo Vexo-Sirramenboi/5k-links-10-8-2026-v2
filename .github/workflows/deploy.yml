@@ -13,7 +13,11 @@ permissions:
 
 env:
   SITE_URL: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/svg/site.svg
+  # files under this URL are saved at the site root with the same layout (svg/, assets/, ...); other hosts go in _ext/
+  ROOT_PREFIX: https://cdn.jsdelivr.net/gh/nautilus-os/GUST@latest/
   TOTAL_PAGES: 5000
+  # GitHub Pages caps a published site at ~1 GB; copies are reduced automatically to stay under this
+  MAX_TOTAL_MB: 900
   # "/<repo-name>" for a project Pages site (user.github.io/repo/); set to "" for a custom domain or user.github.io repo
   BASE_PATH: /${{ github.event.repository.name }}
 
@@ -52,6 +56,9 @@ jobs:
           const START = process.argv[2];
           const OUT = process.argv[3] || 'site';
           const BASE = (process.env.BASE_PATH || '').replace(/\/$/, ''); // e.g. "/my-repo" for project Pages, "" for custom domain/user site
+          // Files whose URL starts with ROOT_PREFIX are saved at the site root with the same relative layout
+          // (so ../assets/x.js style references keep working); everything else goes under _ext/<host>/.
+          const ROOT_PREFIX = process.env.ROOT_PREFIX || '';
           const SETTLE_MS = Number(process.env.SETTLE_MS || 8000);
 
           if (!START) { console.error('usage: node scripts/mirror.js <url> [outDir]'); process.exit(1); }
@@ -68,8 +75,11 @@ jobs:
 
           function localPathFor(url, contentType) {
             const u = new URL(url);
-            let p = decodeURIComponent(u.pathname);
-            if (p.endsWith('/')) p += 'index';
+            const inRoot = ROOT_PREFIX && url.startsWith(ROOT_PREFIX);
+            let p = inRoot
+              ? decodeURIComponent(new URL(url).pathname.slice(new URL(ROOT_PREFIX).pathname.length))
+              : decodeURIComponent(u.pathname);
+            if (p === '' || p.endsWith('/')) p += 'index';
             const ct = (contentType || '').split(';')[0].trim().toLowerCase();
             let ext = path.extname(p);
             if (!ext && EXT[ct]) { p += EXT[ct]; ext = EXT[ct]; }
@@ -78,7 +88,7 @@ jobs:
               p = p.slice(0, p.length - ext.length) + '.' + h + ext;
             }
             p = p.replace(/[:*?"<>|\\]/g, '_');
-            return `_ext/${u.host.replace(":", "_")}${p}`;
+            return inRoot ? p.replace(/^\/+/, '') : `_ext/${u.host.replace(':', '_')}/${p.replace(/^\/+/, '')}`;
           }
 
           (async () => {
@@ -141,7 +151,7 @@ jobs:
             const entryRel = entry ? entry.rel : [...saved.values()][0]?.rel;
             if (!entryRel) { console.error('Nothing was captured.'); process.exit(1); }
             fs.mkdirSync(OUT, { recursive: true });
-            fs.writeFileSync(path.join(OUT, 'index.html'),
+            if (entryRel !== 'index.html') fs.writeFileSync(path.join(OUT, 'index.html'),
               `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Redirecting…</title>` +
               `<meta http-equiv="refresh" content="0; url=./${entryRel}"></head>` +
               `<body><a href="./${entryRel}">Continue</a></body></html>`);
@@ -151,24 +161,75 @@ jobs:
           })();
           MIRROR_EOF
           cat > .build/generate-pages.js <<'GENERATE_EOF'
-          // Usage: node scripts/generate-pages.js <distDir>
-          // Creates TOTAL unique random nested paths inside <distDir>. Each path gets an index.html
-          // that shows the mirrored site full-screen (iframe), so the URL stays on the random path
-          // and the mirrored files (in _ext/) are shared instead of copied 5,000 times.
-          // Also writes <distDir>/links/index.html (searchable list) and <distDir>/links.txt.
+          // Usage: node scripts/generate-pages.js <rawDir> <distDir>
+          // <rawDir> is the crawl output made with BASE_PATH=/__BASE__ (a placeholder prefix).
+          // Writes into <distDir>:
+          //   - one copy of the site at the root
+          //   - up to TOTAL_PAGES more FULL copies, each at its own random nested path (2-4 segments),
+          //     with every internal URL rewritten to that copy's own path
+          //   - /links/index.html and /links.txt listing every path
+          // GitHub Pages caps a published site at ~1 GB, so the page count is reduced automatically
+          // if TOTAL_PAGES full copies wouldn't fit (MAX_TOTAL_MB, default 900). Git LFS is not
+          // supported by Pages, so it can't be used to get around the cap.
           const fs = require('fs');
           const path = require('path');
 
-          const DIST = process.argv[2] || 'dist';
-          const TOTAL = Number(process.env.TOTAL_PAGES || 5000);
+          const RAW = process.argv[2] || '.build/raw';
+          const DIST = process.argv[3] || 'dist';
+          const WANT = Number(process.env.TOTAL_PAGES || 5000);
           const BASE = (process.env.BASE_PATH || '').replace(/\/$/, '');
+          const MAX_BYTES = Number(process.env.MAX_TOTAL_MB || 900) * 1024 * 1024;
+          const TOKEN = '/__BASE__';
+          const TEXT_EXT = /\.(svg|css|js|mjs|html|htm|json|txt|xml|map|webmanifest)$/i;
 
-          // find the mirrored entry document from the redirect index.html written by mirror.js
-          const rootIndex = fs.readFileSync(path.join(DIST, 'index.html'), 'utf8');
-          const m = rootIndex.match(/url=\.\/([^"]+)"/);
-          if (!m) { console.error('Could not find mirrored entry in index.html (run Fetch Site first).'); process.exit(1); }
-          const ENTRY = `${BASE}/${m[1]}`;
+          // ---- read the raw crawl into memory once
+          const files = [];
+          (function walk(dir, rel = '') {
+            for (const name of fs.readdirSync(dir)) {
+              const full = path.join(dir, name), r = rel ? `${rel}/${name}` : name;
+              if (fs.statSync(full).isDirectory()) walk(full, r);
+              else {
+                const buf = fs.readFileSync(full);
+                files.push({ rel: r, isText: TEXT_EXT.test(name), buf, text: TEXT_EXT.test(name) ? buf.toString('utf8') : null });
+              }
+            }
+          })(RAW);
 
+          const rootIndex = files.find(f => f.rel === 'index.html');
+          if (!rootIndex) { console.error('No index.html in raw crawl (crawl failed?).'); process.exit(1); }
+          const m = rootIndex.text.match(/url=\.\/([^"]+)"/);
+          const ENTRY = m ? m[1] : null;            // null => the site ships its own real index.html
+          const entryIsSvg = ENTRY && /\.svg$/i.test(ENTRY);
+
+          // ---- how many full copies fit?
+          const siteBytes = files.reduce((n, f) => n + f.buf.length, 0) * 1.05 + 4096; // small margin for longer rewritten URLs
+          const fit = Math.max(0, Math.floor(MAX_BYTES / siteBytes) - 1); // -1 for the root copy
+          const COUNT = Math.min(WANT, fit);
+          console.log(`Site size ~${(siteBytes / 1048576).toFixed(2)} MB; ${WANT} requested, ${fit} fit under ${MAX_BYTES / 1048576} MB -> generating ${COUNT} copies.`);
+          if (COUNT < WANT) console.warn(`::warning::Only ${COUNT} of ${WANT} full copies fit under the GitHub Pages size limit (site is ~${(siteBytes / 1048576).toFixed(2)} MB). Git LFS is not supported by Pages.`);
+
+          function writeCopy(prefixPath /* '' or 'abc/def' */, wrapper) {
+            const outBase = path.join(DIST, prefixPath);
+            const urlBase = prefixPath ? `${BASE}/${prefixPath}` : BASE;
+            for (const f of files) {
+              const dest = path.join(outBase, f.rel);
+              fs.mkdirSync(path.dirname(dest), { recursive: true });
+              if (f.isText) fs.writeFileSync(dest, f.text.split(TOKEN).join(urlBase));
+              else fs.writeFileSync(dest, f.buf);
+            }
+            if (wrapper && ENTRY) {
+              fs.writeFileSync(path.join(outBase, 'index.html'), `<!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8">
+          <base href="${urlBase}/">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>App</title>
+          <style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}object{width:100%;height:100%;border:none;display:block}</style>
+          </head><body><object data="${ENTRY}"${entryIsSvg ? ' type="image/svg+xml"' : ''}></object></body></html>
+          `);
+            }
+          }
+
+          // ---- unique random nested paths
           const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
           const seg = (min = 4, max = 10) => {
             const n = Math.floor(Math.random() * (max - min + 1)) + min;
@@ -177,28 +238,16 @@ jobs:
             return s;
           };
           const nested = () => Array.from({ length: 2 + Math.floor(Math.random() * 3) }, () => seg()).join('/');
-
+          const topLevel = new Set(files.map(f => f.rel.split('/')[0]).concat(['links']));
           const paths = new Set();
-          while (paths.size < TOTAL) {
+          while (paths.size < COUNT) {
             const p = nested();
-            // avoid colliding with reserved top-level names or being a prefix of another path
-            if (['_ext', 'links'].includes(p.split('/')[0])) continue;
+            if (topLevel.has(p.split('/')[0])) continue;
             paths.add(p);
           }
 
-          const page = `<!DOCTYPE html>
-          <html lang="en"><head><meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Loading</title>
-          <style>html,body{margin:0;height:100%;background:#000}iframe{border:0;width:100%;height:100%;display:block}</style>
-          </head><body><iframe src="${ENTRY}" allow="fullscreen; autoplay; clipboard-write" allowfullscreen></iframe></body></html>
-          `;
-
-          for (const p of paths) {
-            const dir = path.join(DIST, p);
-            fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(path.join(dir, 'index.html'), page);
-          }
+          writeCopy('', false);                       // root copy (index.html = redirect to the entry)
+          for (const p of paths) writeCopy(p, true);  // full copy per random path
 
           const list = [...paths];
           fs.writeFileSync(path.join(DIST, 'links.txt'), list.map(p => `${BASE}/${p}/`).join('\n') + '\n');
@@ -214,7 +263,7 @@ jobs:
           a{display:block;padding:10px;border:1px solid #30363d;border-radius:6px;background:#161b22;color:#58a6ff;font:12px monospace;text-align:center;text-decoration:none;word-break:break-all}
           a:hover{background:#21262d}.hidden{display:none}
           </style></head><body>
-          <h1>Links</h1><p>${TOTAL.toLocaleString()} paths</p>
+          <h1>Links</h1><p>${list.length.toLocaleString()} paths</p>
           <input id="f" placeholder="Filter…" autocomplete="off">
           <main class="grid" id="g">${list.map(p => `<a href="${BASE}/${p}/">${p}</a>`).join('')}</main>
           <script>
@@ -222,18 +271,21 @@ jobs:
           document.getElementById('f').addEventListener('input',e=>{const t=e.target.value.toLowerCase().trim();cards.forEach(c=>c.classList.toggle('hidden',!c.textContent.includes(t)))});
           </script></body></html>`);
 
-          console.log(`Generated ${paths.size} pages -> ${DIST} (entry ${ENTRY})`);
+          console.log(`Done: root copy + ${list.length} full copies in ${DIST}`);
           GENERATE_EOF
 
       - name: Crawl site and save all dependencies
         run: |
+          # BASE_PATH is a placeholder here; each copy gets its own real path in the next step
+          BASE_PATH=/__BASE__ node .build/mirror.js "$SITE_URL" .build/raw
+
+      - name: Generate 5,000 full copies at random nested paths
+        run: |
           mkdir -p dist
-          node .build/mirror.js "$SITE_URL" dist
+          node .build/generate-pages.js .build/raw dist
           touch dist/.nojekyll
           test -f dist/index.html
-
-      - name: Generate 5,000 random nested pages
-        run: node .build/generate-pages.js dist
+          du -sh dist
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
